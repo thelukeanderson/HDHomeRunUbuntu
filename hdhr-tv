@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""hdhr-tv: pick an HDHomeRun channel from a menu (with what's on now) and watch it in VLC.
+
+Usage:
+  hdhr-tv [tuner-ip]     open the channel menu (finds the tuner automatically)
+  hdhr-tv --setup        set up this computer: install VLC + Zenity, install this
+                         script, add "Live TV" to the app menu, check the tuner
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+GUIDE_MAX_AGE = 15 * 60  # seconds before guide data is re-downloaded
+PACKAGES = {"vlc": "vlc", "zenity": "zenity"}  # command -> apt package
+LOG = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "hdhr-tv.log"
+
+
+def log(msg):
+    try:
+        LOG.parent.mkdir(parents=True, exist_ok=True)
+        with LOG.open("a") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+    except OSError:
+        pass
+
+
+# ---------- tuner + guide ----------
+
+def fetch_json(url, timeout=8):
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return json.load(resp)
+
+
+def find_tuner():
+    devices = fetch_json("http://ipv4-api.hdhomerun.com/discover")
+    if not devices:
+        raise RuntimeError("No HDHomeRun found on this internet connection.")
+    return devices[0]["LocalIP"]
+
+
+def fetch_guide(ip):
+    """Return {GuideNumber: [shows]}, or {} if the guide can't be downloaded."""
+    try:
+        auth = fetch_json(f"http://{ip}/discover.json")["DeviceAuth"]
+        guide = fetch_json(f"https://api.hdhomerun.com/api/guide.php?DeviceAuth={auth}", timeout=15)
+        return {ch["GuideNumber"]: ch.get("Guide", []) for ch in guide}
+    except Exception as e:
+        log(f"guide unavailable: {e}")
+        return {}
+
+
+def show_at(shows, now):
+    """Return (current_show, next_show) at time `now`; either may be None."""
+    for i, show in enumerate(shows):
+        if show["StartTime"] <= now < show["EndTime"]:
+            nxt = shows[i + 1] if i + 1 < len(shows) else None
+            return show, nxt
+    upcoming = [s for s in shows if s["StartTime"] > now]
+    return None, (upcoming[0] if upcoming else None)
+
+
+def title_of(show):
+    if not show:
+        return ""
+    ep = show.get("EpisodeTitle")
+    return f"{show['Title']}: {ep}" if ep else show["Title"]
+
+
+def clock(ts):
+    return time.strftime("%-I:%M %p", time.localtime(ts))
+
+
+def build_rows(lineup, guide, now):
+    """One row per playable channel: [number, name, on now, until, next]."""
+    rows = []
+    for ch in lineup:
+        if ch.get("DRM"):  # encrypted channels won't play
+            continue
+        cur, nxt = show_at(guide.get(ch["GuideNumber"], []), now)
+        rows.append([
+            ch["GuideNumber"],
+            ch["GuideName"],
+            title_of(cur),
+            clock(cur["EndTime"]) if cur else "",
+            title_of(nxt),
+        ])
+    return rows
+
+
+# ---------- menu + player ----------
+
+class MenuError(Exception):
+    pass
+
+
+def menu_choice(returncode, stdout, stderr):
+    """Interpret zenity's result: a channel number, None for Quit, or MenuError."""
+    if returncode == 0:
+        choice = stdout.strip().split("|")[0]
+        return choice or None
+    if returncode == 1:  # Quit button or window closed
+        return None
+    raise MenuError(f"zenity exited with code {returncode}: {stderr.strip()}")
+
+
+def pick_channel(rows, last):
+    args = [
+        "zenity", "--list", "--title=Live TV", "--width=900", "--height=650",
+        f"--text=Pick a channel (type to search).{f'  Watching {last}.' if last else ''}",
+        "--ok-label=Watch", "--cancel-label=Quit",
+        "--column=Ch", "--column=Channel", "--column=On now", "--column=Until", "--column=Next",
+    ]
+    for row in rows:
+        args += [cell or " " for cell in row]  # zenity drops empty cells
+    r = subprocess.run(args, capture_output=True, text=True)
+    log(f"menu exit={r.returncode} out={r.stdout.strip()!r}")
+    return menu_choice(r.returncode, r.stdout, r.stderr)
+
+
+def play(url, label):
+    # --one-instance reuses the open VLC window, so switching channels frees the old tuner.
+    log(f"play {label} {url}")
+    subprocess.Popen(
+        ["vlc", "--one-instance", "--no-playlist-enqueue", url, f":meta-title={label}"],
+        stdout=subprocess.DEVNULL, stderr=LOG.open("a"), start_new_session=True,
+    )
+
+
+def error(msg):
+    log(f"error: {msg}")
+    print(msg, file=sys.stderr)
+    if shutil.which("zenity"):
+        subprocess.run(["zenity", "--error", "--title=Live TV", f"--text={msg}"])
+    sys.exit(1)
+
+
+def watch(ip=None):
+    missing = [cmd for cmd in PACKAGES if not shutil.which(cmd)]
+    if missing:
+        error(f"Missing {', '.join(missing)}. Run:  hdhr-tv --setup")
+    try:
+        ip = ip or find_tuner()
+        lineup = fetch_json(f"http://{ip}/lineup.json", timeout=5)
+    except Exception as e:
+        error(f"Can't reach the HDHomeRun.\nIs this computer on the same network as the tuner?\n\n({e})")
+    log(f"start: tuner {ip}, {len(lineup)} channels")
+
+    channels = {ch["GuideNumber"]: ch for ch in lineup}
+    guide, guide_time, last = {}, 0, None
+    while True:
+        if time.time() - guide_time > GUIDE_MAX_AGE:
+            guide, guide_time = fetch_guide(ip), time.time()
+        try:
+            number = pick_channel(build_rows(lineup, guide, time.time()), last)
+        except MenuError as e:
+            error(f"The channel menu couldn't open.\n\n({e})")
+        if number is None:
+            log("quit")
+            break
+        ch = channels[number]
+        last = f"{ch['GuideNumber']} {ch['GuideName']}"
+        play(ch["URL"], last)
+
+
+# ---------- setup ----------
+
+def desktop_entry(exe):
+    return (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Name=Live TV\n"
+        "Comment=Watch HDHomeRun channels\n"
+        f"Exec={exe}\n"
+        "Icon=vlc\n"
+        "Terminal=false\n"
+        "Categories=AudioVideo;Video;TV;\n"
+    )
+
+
+def local_ips():
+    out = subprocess.run(["hostname", "-I"], capture_output=True, text=True).stdout.split()
+    return [ip for ip in out if "." in ip]
+
+
+def same_subnet24(a, b):
+    return a.split(".")[:3] == b.split(".")[:3]
+
+
+def install_packages(missing):
+    pkgs = [PACKAGES[cmd] for cmd in missing]
+    print(f"Installing {' '.join(pkgs)} (you may be asked for your password)...")
+    subprocess.run(["sudo", "apt-get", "update"], check=True)
+    subprocess.run(["sudo", "apt-get", "install", "-y", *pkgs], check=True)
+
+
+def check_tuner():
+    """Print whether this computer can reach the tuner. Returns True if it can."""
+    try:
+        ip = find_tuner()
+    except Exception as e:
+        print(f"  ! Couldn't look up the tuner online ({e}).")
+        print("    Check this computer has internet, then run  hdhr-tv --setup  again.")
+        return False
+    try:
+        info = fetch_json(f"http://{ip}/discover.json", timeout=5)
+        lineup = fetch_json(f"http://{ip}/lineup.json", timeout=5)
+    except Exception:
+        mine = local_ips()
+        print(f"  ! Found the tuner at {ip}, but this computer can't reach it.")
+        if mine and not any(same_subnet24(ip, m) for m in mine):
+            print(f"    This computer is at {', '.join(mine)}, a different network from the tuner.")
+            print("    It's probably on a second router's Wi-Fi. Connect it to the same")
+            print("    Wi-Fi/router as the HDHomeRun, then run  hdhr-tv --setup  again.")
+        return False
+    print(f"  ok {info.get('FriendlyName', 'HDHomeRun')} at {ip}: {len(lineup)} channels")
+    return True
+
+
+def setup(home=None):
+    home = Path(home or Path.home())
+    if sys.platform != "linux" or not shutil.which("apt-get"):
+        print("Setup supports Ubuntu/Debian (apt) only.")
+        return 1
+
+    print("1. Programs")
+    missing = [cmd for cmd in PACKAGES if not shutil.which(cmd)]
+    if missing:
+        try:
+            install_packages(missing)
+        except (subprocess.CalledProcessError, OSError) as e:
+            print(f"  ! Install failed ({e}). Try:  sudo apt install {' '.join(PACKAGES.values())}")
+            return 1
+    print(f"  ok {', '.join(PACKAGES)} installed")
+
+    print("2. Script")
+    exe = home / ".local/bin/hdhr-tv"
+    exe.parent.mkdir(parents=True, exist_ok=True)
+    src = Path(__file__).resolve()
+    if src != exe.resolve():
+        shutil.copyfile(src, exe)
+    exe.chmod(0o755)
+    print(f"  ok {exe}")
+
+    print("3. App menu")
+    entry = home / ".local/share/applications/hdhr-tv.desktop"
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    entry.write_text(desktop_entry(exe))
+    print(f"  ok \"Live TV\" ({entry})")
+
+    print("4. Tuner")
+    reachable = check_tuner()
+
+    print()
+    if reachable:
+        print("All set. Open \"Live TV\" from the app menu, or run  hdhr-tv")
+    else:
+        print("Installed, but fix the tuner problem above before watching.")
+    if str(exe.parent) not in os.environ.get("PATH", "").split(":"):
+        print(f"(To run hdhr-tv from a terminal, log out and back in first, or use {exe})")
+    return 0 if reachable else 2
+
+
+def main(argv):
+    if argv[1:2] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
+    if argv[1:2] == ["--setup"]:
+        return setup()
+    watch(argv[1] if len(argv) > 1 else None)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
