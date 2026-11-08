@@ -1,23 +1,33 @@
 #!/usr/bin/env python3
-"""hdhr-tv: pick an HDHomeRun channel from a menu (with what's on now) and watch it in VLC.
+"""hdhr-tv: a TV guide for your HDHomeRun. Pick a show and watch it in VLC.
 
 Usage:
-  hdhr-tv [tuner-ip]     open the channel menu (finds the tuner automatically)
-  hdhr-tv --setup        set up this computer: install VLC + Zenity, install this
-                         script, add "Live TV" to the app menu, check the tuner
+  hdhr-tv [tuner-ip]     open the guide (finds the tuner automatically)
+  hdhr-tv --setup        set up this computer: install VLC and the GTK libraries,
+                         install this script, add "Live TV" to the app menu,
+                         and check the tuner
 """
 import json
 import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
 
-GUIDE_MAX_AGE = 15 * 60  # seconds before guide data is re-downloaded
-PACKAGES = {"vlc": "vlc", "zenity": "zenity"}  # command -> apt package
+APP_ID = "io.github.thelukeanderson.HDHomeRunUbuntu"
+GTK_PACKAGES = ["python3-gi", "gir1.2-gtk-4.0", "gir1.2-adw-1"]
 LOG = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "hdhr-tv.log"
+
+GUIDE_REFRESH = 30 * 60  # seconds between guide downloads
+SLOT = 30 * 60           # the time ruler is marked every half hour
+MIN_HOURS, MAX_HOURS = 3, 12
+PX_PER_MIN = 4           # 2 hours = 480 px
+ROW_H = 56
+CHANNEL_W = 160
+RULER_H = 36
 
 
 def log(msg):
@@ -29,7 +39,7 @@ def log(msg):
         pass
 
 
-# ---------- tuner + guide ----------
+# ---------- tuner + guide data ----------
 
 def fetch_json(url, timeout=8):
     with urllib.request.urlopen(url, timeout=timeout) as resp:
@@ -43,15 +53,39 @@ def find_tuner():
     return devices[0]["LocalIP"]
 
 
+def merge_guides(*guides):
+    """Combine {GuideNumber: [shows]} dicts, dropping duplicates and sorting by start time."""
+    merged = {}
+    for guide in guides:
+        for number, shows in guide.items():
+            by_start = merged.setdefault(number, {})
+            for show in shows:
+                by_start[show["StartTime"]] = show
+    return {number: [by_start[t] for t in sorted(by_start)] for number, by_start in merged.items()}
+
+
 def fetch_guide(ip):
-    """Return {GuideNumber: [shows]}, or {} if the guide can't be downloaded."""
+    """Return {GuideNumber: [shows]} covering the next several hours, or {} if unavailable.
+
+    Each guide request covers about four hours, so a second request picks up where
+    the first one ends.
+    """
     try:
         auth = fetch_json(f"http://{ip}/discover.json")["DeviceAuth"]
-        guide = fetch_json(f"https://api.hdhomerun.com/api/guide.php?DeviceAuth={auth}", timeout=15)
-        return {ch["GuideNumber"]: ch.get("Guide", []) for ch in guide}
+        url = f"https://api.hdhomerun.com/api/guide.php?DeviceAuth={auth}"
+        first = merge_guides({ch["GuideNumber"]: ch.get("Guide", []) for ch in fetch_json(url, timeout=15)})
     except Exception as e:
         log(f"guide unavailable: {e}")
         return {}
+    ends = [shows[-1]["EndTime"] for shows in first.values() if shows]
+    if not ends:
+        return first
+    try:
+        more = fetch_json(f"{url}&Start={min(ends)}", timeout=15)
+        return merge_guides(first, {ch["GuideNumber"]: ch.get("Guide", []) for ch in more})
+    except Exception as e:
+        log(f"extra guide hours unavailable: {e}")
+        return first
 
 
 def show_at(shows, now):
@@ -75,99 +109,458 @@ def clock(ts):
     return time.strftime("%-I:%M %p", time.localtime(ts))
 
 
-def build_rows(lineup, guide, now):
-    """One row per playable channel: [number, name, on now, until, next]."""
-    rows = []
-    for ch in lineup:
-        if ch.get("DRM"):  # encrypted channels won't play
-            continue
-        cur, nxt = show_at(guide.get(ch["GuideNumber"], []), now)
-        rows.append([
-            ch["GuideNumber"],
-            ch["GuideName"],
-            title_of(cur),
-            clock(cur["EndTime"]) if cur else "",
-            title_of(nxt),
-        ])
-    return rows
+def time_range(show):
+    return f"{clock(show['StartTime'])} – {clock(show['EndTime'])}"
 
 
-# ---------- menu + player ----------
+# ---------- guide layout ----------
 
-class MenuError(Exception):
-    pass
+def guide_window(guide, now):
+    """The span of time the guide shows: from the current half hour to the last listing."""
+    t0 = int(now) - int(now) % SLOT
+    last = max((s["EndTime"] for shows in guide.values() for s in shows), default=0)
+    t1 = min(max(last, t0 + MIN_HOURS * 3600), t0 + MAX_HOURS * 3600)
+    return t0, t1 + (-t1) % SLOT
 
 
-def menu_choice(returncode, stdout, stderr):
-    """Interpret zenity's result: a channel number, None for Quit, or MenuError."""
-    if returncode == 0:
-        choice = stdout.strip().split("|")[0]
-        return choice or None
-    if returncode == 1:  # Quit button or window closed
+def time_slots(t0, t1):
+    return list(range(t0, t1, SLOT))
+
+
+def x_at(ts, t0):
+    return round((ts - t0) / 60 * PX_PER_MIN)
+
+
+def cell_span(show, t0, t1):
+    """(x, width) in pixels of a show's block, clipped to the guide window; None if outside it."""
+    start, end = max(show["StartTime"], t0), min(show["EndTime"], t1)
+    if end <= start:
         return None
-    raise MenuError(f"zenity exited with code {returncode}: {stderr.strip()}")
+    return x_at(start, t0), x_at(end, t0) - x_at(start, t0)
 
 
-def pick_channel(rows, last):
-    args = [
-        "zenity", "--list", "--title=Live TV", "--width=900", "--height=650",
-        f"--text=Pick a channel (type to search).{f'  Watching {last}.' if last else ''}",
-        "--ok-label=Watch", "--cancel-label=Quit",
-        "--column=Ch", "--column=Channel", "--column=On now", "--column=Until", "--column=Next",
-    ]
-    for row in rows:
-        args += [cell or " " for cell in row]  # zenity drops empty cells
-    r = subprocess.run(args, capture_output=True, text=True)
-    log(f"menu exit={r.returncode} out={r.stdout.strip()!r}")
-    return menu_choice(r.returncode, r.stdout, r.stderr)
+def cell_state(show, now):
+    """CSS class for a show's block at time `now`: "past", "on-now", or None (upcoming)."""
+    if not show:
+        return None
+    if show["EndTime"] <= now:
+        return "past"
+    return "on-now" if show["StartTime"] <= now else None
+
+
+def channel_matches(channel, shows, query):
+    """Search by channel number, channel name, or any show title in the guide."""
+    q = query.strip().lower()
+    if not q:
+        return True
+    return (channel["GuideNumber"].startswith(q)
+            or q in channel["GuideName"].lower()
+            or any(q in title_of(s).lower() for s in shows))
+
+
+# ---------- playing ----------
+
+PI_MODEL_FILE = Path("/proc/device-tree/model")
+
+# US broadcast TV is MPEG-2, which the Raspberry Pi 5 has no hardware decoder for, so
+# VLC decodes and deinterlaces every frame on the CPU. These keep that affordable:
+PI_VLC_OPTIONS = [
+    "--deinterlace-mode=bob",  # much cheaper than the default method and looks close
+                               # (VLC still only deinterlaces channels that need it)
+    "--avcodec-fast",          # allow decoder speed shortcuts
+    "--avcodec-hw=none",       # don't probe for hardware decoders the Pi doesn't have
+]
+PI_ITEM_OPTIONS = [":network-caching=2000"]  # a 2 s buffer rides out Wi-Fi hiccups
+
+
+def is_raspberry_pi(model_file=None):
+    try:
+        return "Raspberry Pi" in Path(model_file or PI_MODEL_FILE).read_text(errors="ignore")
+    except OSError:
+        return False
+
+
+def vlc_command(url, label, pi=False):
+    # --one-instance reuses the open VLC window, so switching channels frees the old tuner.
+    cmd = ["vlc", "--one-instance", "--no-playlist-enqueue"]
+    if pi:
+        cmd += PI_VLC_OPTIONS
+    cmd += [url, f":meta-title={label}"]
+    if pi:
+        cmd += PI_ITEM_OPTIONS
+    return cmd
 
 
 def play(url, label):
-    # --one-instance reuses the open VLC window, so switching channels frees the old tuner.
-    log(f"play {label} {url}")
-    subprocess.Popen(
-        ["vlc", "--one-instance", "--no-playlist-enqueue", url, f":meta-title={label}"],
-        stdout=subprocess.DEVNULL, stderr=LOG.open("a"), start_new_session=True,
-    )
+    pi = is_raspberry_pi()
+    log(f"play {label} {url}{' (Raspberry Pi settings)' if pi else ''}")
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    with LOG.open("a") as errors:
+        subprocess.Popen(vlc_command(url, label, pi),
+                         stdout=subprocess.DEVNULL, stderr=errors, start_new_session=True)
+
+
+# ---------- the guide window ----------
+
+CSS = """
+.guide-body { background: @view_bg_color; }
+.channel-column { border-right: 1px solid alpha(currentColor, 0.12); }
+.ruler-row { border-bottom: 1px solid alpha(currentColor, 0.12); }
+.ruler-label { font-size: 0.85em; font-weight: bold; opacity: 0.6; }
+button.channel-cell { border-radius: 0; padding: 0 16px; min-height: 0; }
+.channel-number { font-weight: 800; font-size: 1.1em; }
+.channel-name { font-size: 0.85em; opacity: 0.6; }
+button.channel-cell.watching .channel-number { color: @accent_color; }
+button.guide-cell {
+  padding: 4px 10px; min-height: 0; min-width: 0; border-radius: 8px;
+  background: alpha(currentColor, 0.06); box-shadow: none;
+}
+button.guide-cell:hover { background: alpha(currentColor, 0.12); }
+button.guide-cell.on-now { background: alpha(@accent_bg_color, 0.22); }
+button.guide-cell.on-now:hover { background: alpha(@accent_bg_color, 0.34); }
+button.guide-cell.past { opacity: 0.45; }
+button.guide-cell.narrow { padding: 0; }
+.cell-title { font-weight: 600; }
+.cell-time { font-size: 0.8em; opacity: 0.65; }
+.now-line { background: #e01b24; min-width: 2px; }
+"""
+
+
+def has_gtk():
+    try:
+        import gi
+        gi.require_version("Gtk", "4.0")
+        gi.require_version("Adw", "1")
+        from gi.repository import Adw, Gtk  # noqa: F401
+        return True
+    except (ImportError, ValueError):
+        return False
+
+
+def run_gui(ip=None, on_ready=None, unique=True, fetch=None, guide_fetch=None):
+    """Open the guide window. on_ready(window) is called after the first draw (used by tests)."""
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango
+
+    fetch = fetch or fetch_json
+    guide_fetch = guide_fetch or fetch_guide
+
+    def clear(container):
+        while (child := container.get_first_child()) is not None:
+            container.remove(child)
+
+    def text(label, classes=(), wrap=False):
+        lbl = Gtk.Label(label=label, xalign=0, css_classes=list(classes))
+        if wrap:
+            lbl.set_wrap(True)
+            lbl.set_max_width_chars(48)
+        else:
+            # max_width_chars=1 lets the label shrink to its block and ellipsize.
+            lbl.set_ellipsize(Pango.EllipsizeMode.END)
+            lbl.set_max_width_chars(1)
+        return lbl
+
+    class GuideWindow(Adw.ApplicationWindow):
+        def __init__(self, app):
+            super().__init__(application=app, title="Live TV", default_width=1280, default_height=800)
+            self.ip = ip
+            self.lineup, self.guide, self.device = [], {}, "HDHomeRun"
+            self.t0 = self.t1 = 0
+            self.guide_time = 0
+            self.watching = None
+            self.popover_open = False
+            self.loading = False
+            self.ready_sent = False
+            self.timed_cells = []     # (button, show): re-styled as time passes
+            self.now_lines = []       # red "now" lines, moved each minute
+            self.channel_buttons = {}  # "4.1 WCCO" -> button, to mark what's playing
+
+            self.heading = Adw.WindowTitle(title="Live TV", subtitle="Finding your tuner…")
+            header = Adw.HeaderBar()
+            header.set_title_widget(self.heading)
+            self.search = Gtk.SearchEntry(placeholder_text="Search channels and shows", width_request=280)
+            self.search.set_key_capture_widget(self)
+            self.search.connect("search-changed", lambda *_: self.render())
+            header.pack_start(self.search)
+            refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Reload the guide")
+            refresh.connect("clicked", lambda *_: self.load())
+            header.pack_end(refresh)
+            now = Gtk.Button(label="Now", tooltip_text="Jump to the current time")
+            now.connect("clicked", lambda *_: self.grid_sw.get_hadjustment().set_value(0))
+            header.pack_end(now)
+
+            self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+            spinner = Gtk.Spinner(spinning=True, width_request=32, height_request=32)
+            self.stack.add_named(Adw.StatusPage(title="Loading the guide…", child=spinner), "loading")
+            retry = Gtk.Button(label="Try Again", halign=Gtk.Align.CENTER, css_classes=["pill", "suggested-action"])
+            retry.connect("clicked", lambda *_: self.load())
+            self.error_page = Adw.StatusPage(icon_name="network-offline-symbolic",
+                                             title="Can't reach your HDHomeRun", child=retry)
+            self.stack.add_named(self.error_page, "error")
+            self.stack.add_named(self.build_guide(), "guide")
+
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            box.append(header)
+            box.append(self.stack)
+            self.set_content(box)
+
+            GLib.timeout_add_seconds(60, self.tick)
+            self.load()
+
+        def build_guide(self):
+            self.ruler = Gtk.Fixed()
+            self.channels = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            self.cells = Gtk.Fixed()
+            self.grid_sw = Gtk.ScrolledWindow(child=self.cells, hexpand=True, vexpand=True)
+
+            ruler_sw = Gtk.ScrolledWindow(child=self.ruler, hexpand=True,
+                                          hadjustment=self.grid_sw.get_hadjustment())
+            ruler_sw.set_policy(Gtk.PolicyType.EXTERNAL, Gtk.PolicyType.NEVER)
+            channel_sw = Gtk.ScrolledWindow(child=self.channels, css_classes=["channel-column"],
+                                            vadjustment=self.grid_sw.get_vadjustment())
+            channel_sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.EXTERNAL)
+
+            corner = Gtk.Box(css_classes=["channel-column"], width_request=CHANNEL_W)
+            top = Gtk.Box(css_classes=["ruler-row"])
+            top.append(corner)
+            top.append(ruler_sw)
+            bottom = Gtk.Box(vexpand=True)
+            bottom.append(channel_sw)
+            bottom.append(self.grid_sw)
+            page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, css_classes=["guide-body"])
+            page.append(top)
+            page.append(bottom)
+            return page
+
+        # ----- data -----
+
+        def load(self):
+            if self.loading:
+                return
+            self.loading = True
+
+            def work():
+                try:
+                    tuner = self.ip or find_tuner()
+                    info = fetch(f"http://{tuner}/discover.json", timeout=5)
+                    lineup = fetch(f"http://{tuner}/lineup.json", timeout=5)
+                except Exception as e:
+                    log(f"error: can't reach tuner: {e}")
+                    GLib.idle_add(self.on_error, str(e))
+                    return
+                guide = guide_fetch(tuner)
+                GLib.idle_add(self.on_loaded, tuner, info, lineup, guide)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def on_error(self, err):
+            self.loading = False
+            if self.lineup:  # keep showing the guide we already have
+                self.heading.set_subtitle("Couldn't refresh the guide")
+                return
+            self.error_page.set_description(GLib.markup_escape_text(
+                "Make sure this computer is on the same network as the tuner.\n\n" + err))
+            self.stack.set_visible_child_name("error")
+
+        def on_loaded(self, tuner, info, lineup, guide):
+            self.loading = False
+            self.ip = tuner
+            self.device = info.get("FriendlyName", "HDHomeRun")
+            self.lineup = [ch for ch in lineup if not ch.get("DRM")]  # encrypted channels won't play
+            self.guide = guide
+            self.guide_time = time.time()
+            self.t0, self.t1 = guide_window(guide, time.time())
+            log(f"start: tuner {tuner}, {len(self.lineup)} channels, guide for {len(guide)}")
+            self.update_heading()
+            self.stack.set_visible_child_name("guide")
+            self.render()
+            if on_ready and not self.ready_sent:
+                self.ready_sent = True
+                GLib.idle_add(on_ready, self)
+
+        def tick(self):
+            if time.time() - self.guide_time > GUIDE_REFRESH and self.lineup:
+                self.load()  # redraws everything when the new guide arrives
+            else:
+                self.update_time()
+            return True
+
+        def update_time(self):
+            """Move the now line and re-highlight shows, without rebuilding the guide."""
+            now = time.time()
+            for btn, show in self.timed_cells:
+                state = cell_state(show, now)
+                for cls in ("past", "on-now"):
+                    if cls == state:
+                        btn.add_css_class(cls)
+                    else:
+                        btn.remove_css_class(cls)
+            visible = self.t0 <= now < self.t1
+            for parent, line in self.now_lines:
+                line.set_visible(visible)
+                if visible:
+                    parent.move(line, x_at(now, self.t0), 0)
+
+        def update_heading(self):
+            parts = [f"{self.device} · {len(self.lineup)} channels"]
+            if not self.guide:
+                parts.append("no guide listings")
+            if self.watching:
+                parts.append(f"watching {self.watching}")
+            self.heading.set_subtitle(" · ".join(parts))
+
+        # ----- drawing -----
+
+        def render(self):
+            if self.popover_open or not self.lineup:
+                return
+            query = self.search.get_text()
+            shown = [ch for ch in self.lineup
+                     if channel_matches(ch, self.guide.get(ch["GuideNumber"], []), query)]
+            width = x_at(self.t1, self.t0)
+            height = max(len(shown), 1) * ROW_H
+
+            clear(self.ruler)
+            for ts in time_slots(self.t0, self.t1):
+                self.ruler.put(Gtk.Label(label=clock(ts), css_classes=["ruler-label"]), x_at(ts, self.t0) + 10, 10)
+            self.ruler.set_size_request(width, RULER_H)
+
+            clear(self.channels)
+            clear(self.cells)
+            self.timed_cells, self.now_lines, self.channel_buttons = [], [], {}
+            for row, ch in enumerate(shown):
+                self.channels.append(self.channel_button(ch))
+                shows = self.guide.get(ch["GuideNumber"], [])
+                spans = [(s, cell_span(s, self.t0, self.t1)) for s in shows]
+                spans = [(s, span) for s, span in spans if span] or [(None, (0, width))]
+                for show, (x, w) in spans:
+                    self.cells.put(self.show_button(ch, show, w), x + 2, row * ROW_H + 2)
+            if not shown:
+                self.cells.put(text(f"Nothing matches “{query.strip()}”", ["dim-label"]), 24, 18)
+            self.cells.set_size_request(width, height)
+
+            for parent, h in ((self.cells, height), (self.ruler, RULER_H)):
+                line = Gtk.Box(css_classes=["now-line"], height_request=h, can_target=False)
+                parent.put(line, 0, 0)
+                self.now_lines.append((parent, line))
+            self.update_time()
+
+        def channel_button(self, ch):
+            label = f"{ch['GuideNumber']} {ch['GuideName']}"
+            btn = Gtk.Button(css_classes=["channel-cell", "flat"], tooltip_text=f"Watch {label}",
+                             width_request=CHANNEL_W, height_request=ROW_H)
+            if self.watching == label:
+                btn.add_css_class("watching")
+            self.channel_buttons[label] = btn
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
+            box.append(text(ch["GuideNumber"], ["channel-number"]))
+            box.append(text(ch["GuideName"], ["channel-name"]))
+            btn.set_child(box)
+            btn.connect("clicked", lambda *_: self.play(ch))
+            return btn
+
+        def show_button(self, ch, show, w):
+            btn = Gtk.Button(css_classes=["guide-cell"], width_request=max(w - 4, 4),
+                             height_request=ROW_H - 4)
+            title = show["Title"] if show else "No guide listings"
+            when = time_range(show) if show else ""
+            if show:
+                self.timed_cells.append((btn, show))  # update_time() sets past/on-now
+            if w >= 40:
+                box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, valign=Gtk.Align.CENTER)
+                box.append(text(title, ["cell-title"]))
+                if when:
+                    box.append(text(when, ["cell-time"]))
+                btn.set_child(box)
+            else:
+                btn.add_css_class("narrow")
+            btn.set_tooltip_text(f"{title_of(show) or title}\n{when}".strip())
+            btn.connect("clicked", lambda b: self.show_details(b, ch, show))
+            return btn
+
+        def show_details(self, btn, ch, show):
+            if show is None:
+                self.play(ch)
+                return
+            now = time.time()
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_top=10,
+                          margin_bottom=10, margin_start=10, margin_end=10)
+            box.append(text(show["Title"], ["title-4"], wrap=True))
+            episode = " · ".join(p for p in (show.get("EpisodeNumber"), show.get("EpisodeTitle")) if p)
+            if episode:
+                box.append(text(episode, wrap=True))
+            box.append(text(f"{time_range(show)} · {ch['GuideNumber']} {ch['GuideName']}",
+                            ["dim-label"], wrap=True))
+            if show.get("Synopsis"):
+                box.append(text(show["Synopsis"], wrap=True))
+            on_now = show["StartTime"] <= now < show["EndTime"]
+            watch = Gtk.Button(label="Watch now" if on_now else f"Watch {ch['GuideNumber']} now",
+                               halign=Gtk.Align.START, margin_top=6,
+                               css_classes=["pill", "suggested-action"])
+            box.append(watch)
+
+            pop = Gtk.Popover(child=box)
+            pop.set_parent(btn)
+            watch.connect("clicked", lambda *_: (pop.popdown(), self.play(ch)))
+            pop.connect("closed", self.on_popover_closed)
+            self.popover_open = True
+            pop.popup()
+
+        def on_popover_closed(self, pop):
+            self.popover_open = False
+            GLib.idle_add(lambda: pop.unparent() and False)
+
+        def play(self, ch):
+            self.watching = f"{ch['GuideNumber']} {ch['GuideName']}"
+            play(ch["URL"], self.watching)
+            self.update_heading()
+            for label, btn in self.channel_buttons.items():
+                if label == self.watching:
+                    btn.add_css_class("watching")
+                else:
+                    btn.remove_css_class("watching")
+
+    css = Gtk.CssProvider()
+    if hasattr(css, "load_from_string"):
+        css.load_from_string(CSS)
+    else:
+        css.load_from_data(CSS.encode(), -1)
+
+    flags = Gio.ApplicationFlags.DEFAULT_FLAGS if unique else Gio.ApplicationFlags.NON_UNIQUE
+    app = Adw.Application(application_id=APP_ID, flags=flags)
+
+    def activate(app):
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        (app.get_active_window() or GuideWindow(app)).present()
+
+    app.connect("activate", activate)
+    return app.run([sys.argv[0]])
 
 
 def error(msg):
     log(f"error: {msg}")
     print(msg, file=sys.stderr)
-    if shutil.which("zenity"):
-        subprocess.run(["zenity", "--error", "--title=Live TV", f"--text={msg}"])
+    if shutil.which("notify-send"):  # visible when started from the app menu
+        subprocess.run(["notify-send", "Live TV", msg])
     sys.exit(1)
 
 
 def watch(ip=None):
-    missing = [cmd for cmd in PACKAGES if not shutil.which(cmd)]
-    if missing:
-        error(f"Missing {', '.join(missing)}. Run:  hdhr-tv --setup")
-    try:
-        ip = ip or find_tuner()
-        lineup = fetch_json(f"http://{ip}/lineup.json", timeout=5)
-    except Exception as e:
-        error(f"Can't reach the HDHomeRun.\nIs this computer on the same network as the tuner?\n\n({e})")
-    log(f"start: tuner {ip}, {len(lineup)} channels")
-
-    channels = {ch["GuideNumber"]: ch for ch in lineup}
-    guide, guide_time, last = {}, 0, None
-    while True:
-        if time.time() - guide_time > GUIDE_MAX_AGE:
-            guide, guide_time = fetch_guide(ip), time.time()
-        try:
-            number = pick_channel(build_rows(lineup, guide, time.time()), last)
-        except MenuError as e:
-            error(f"The channel menu couldn't open.\n\n({e})")
-        if number is None:
-            log("quit")
-            break
-        ch = channels[number]
-        last = f"{ch['GuideNumber']} {ch['GuideName']}"
-        play(ch["URL"], last)
+    if missing_packages():
+        error("Live TV isn't fully set up on this computer. Run:  hdhr-tv --setup")
+    return run_gui(ip)
 
 
 # ---------- setup ----------
+
+def missing_packages():
+    """apt packages this computer still needs."""
+    missing = [] if shutil.which("vlc") else ["vlc"]
+    return missing + ([] if has_gtk() else GTK_PACKAGES)
+
 
 def desktop_entry(exe):
     return (
@@ -179,6 +572,7 @@ def desktop_entry(exe):
         "Icon=vlc\n"
         "Terminal=false\n"
         "Categories=AudioVideo;Video;TV;\n"
+        f"StartupWMClass={APP_ID}\n"
     )
 
 
@@ -191,8 +585,7 @@ def same_subnet24(a, b):
     return a.split(".")[:3] == b.split(".")[:3]
 
 
-def install_packages(missing):
-    pkgs = [PACKAGES[cmd] for cmd in missing]
+def install_packages(pkgs):
     print(f"Installing {' '.join(pkgs)} (you may be asked for your password)...")
     subprocess.run(["sudo", "apt-get", "update"], check=True)
     subprocess.run(["sudo", "apt-get", "install", "-y", *pkgs], check=True)
@@ -221,6 +614,44 @@ def check_tuner():
     return True
 
 
+# vcgencmd get_throttled bits: (bit, what it means)
+THROTTLE_FLAGS = [
+    (0, "under-voltage right now"), (1, "CPU speed capped right now"),
+    (2, "throttled right now"), (3, "at its temperature limit right now"),
+    (16, "under-voltage since boot"), (17, "CPU speed capped since boot"),
+    (18, "throttled since boot"), (19, "hit its temperature limit since boot"),
+]
+
+
+def describe_throttled(output):
+    """Turn `vcgencmd get_throttled` output (e.g. "throttled=0x50005") into problems found."""
+    try:
+        value = int(output.strip().split("=")[-1], 16)
+    except ValueError:
+        return None
+    return [why for bit, why in THROTTLE_FLAGS if value & (1 << bit)]
+
+
+def check_pi():
+    """On a Raspberry Pi, report whether it's slowing down from heat or a weak power supply."""
+    print("  Raspberry Pi detected: VLC will use lighter settings for smoother HD.")
+    if not shutil.which("vcgencmd"):
+        print("  (To check for overheating or power problems:  sudo apt install libraspberrypi-bin)")
+        return
+    out = subprocess.run(["vcgencmd", "get_throttled"], capture_output=True, text=True).stdout
+    problems = describe_throttled(out)
+    if problems is None:
+        return
+    if not problems:
+        print("  ok no overheating or power problems")
+        return
+    print(f"  ! This Pi has been slowing itself down: {'; '.join(problems)}.")
+    if any("voltage" in p for p in problems):
+        print("    Use the official 27W Raspberry Pi USB-C power supply.")
+    if any(w in p for p in problems for w in ("temperature", "throttled", "capped")):
+        print("    Add cooling, such as the Raspberry Pi Active Cooler.")
+
+
 def setup(home=None):
     home = Path(home or Path.home())
     if sys.platform != "linux" or not shutil.which("apt-get"):
@@ -228,14 +659,14 @@ def setup(home=None):
         return 1
 
     print("1. Programs")
-    missing = [cmd for cmd in PACKAGES if not shutil.which(cmd)]
+    missing = missing_packages()
     if missing:
         try:
             install_packages(missing)
         except (subprocess.CalledProcessError, OSError) as e:
-            print(f"  ! Install failed ({e}). Try:  sudo apt install {' '.join(PACKAGES.values())}")
+            print(f"  ! Install failed ({e}). Try:  sudo apt install {' '.join(missing)}")
             return 1
-    print(f"  ok {', '.join(PACKAGES)} installed")
+    print("  ok VLC and GTK installed")
 
     print("2. Script")
     exe = home / ".local/bin/hdhr-tv"
@@ -255,6 +686,10 @@ def setup(home=None):
     print("4. Tuner")
     reachable = check_tuner()
 
+    if is_raspberry_pi():
+        print("5. Raspberry Pi")
+        check_pi()
+
     print()
     if reachable:
         print("All set. Open \"Live TV\" from the app menu, or run  hdhr-tv")
@@ -271,8 +706,7 @@ def main(argv):
         return 0
     if argv[1:2] == ["--setup"]:
         return setup()
-    watch(argv[1] if len(argv) > 1 else None)
-    return 0
+    return watch(argv[1] if len(argv) > 1 else None)
 
 
 if __name__ == "__main__":
